@@ -1,0 +1,179 @@
+"""
+AsterDEX Spot V3 client.
+
+Usage:
+    from kairos_aster import SpotClient
+
+    client = SpotClient(
+        user="0xYourMainWallet",
+        signer="0xYourAgentWallet",
+        private_key="0xYourAgentPrivateKey",
+    )
+    order = client.place_order("ASTERUSDT", "BUY", "MARKET", quantity=100)
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from .client import BaseClient
+from .auth import SPOT_STRICT_KEYS
+
+_BASE = "https://sapi.asterdex.com"
+_TESTNET = "https://sapi.asterdex-testnet.com"
+
+
+class SpotClient(BaseClient):
+    """Full Spot V3 REST client."""
+
+    def __init__(
+        self,
+        user: str,
+        signer: str,
+        private_key: str,
+        *,
+        testnet: bool = False,
+        timeout: int = 10,
+        max_retries: int = 3,
+        show_weight: bool = False,
+    ) -> None:
+        base = _TESTNET if testnet else _BASE
+        super().__init__(
+            user, signer, private_key, base,
+            timeout=timeout, max_retries=max_retries, show_weight=show_weight,
+        )
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  PUBLIC — Market Data
+    # ═══════════════════════════════════════════════════════════════════
+
+    def ping(self) -> dict:
+        return self.get_public("/api/v3/ping")
+
+    def server_time(self) -> dict:
+        return self.get_public("/api/v3/time")
+
+    def exchange_info(self) -> dict:
+        return self.get_public("/api/v3/exchangeInfo")
+
+    def depth(self, symbol: str, limit: int = 100) -> dict:
+        return self.get_public("/api/v3/depth", {"symbol": symbol, "limit": limit})
+
+    def trades(self, symbol: str, limit: int = 500) -> list:
+        return self.get_public("/api/v3/trades", {"symbol": symbol, "limit": limit})
+
+    def klines(self, symbol: str, interval: str, limit: int = 500, **kw) -> list:
+        return self.get_public(
+            "/api/v3/klines",
+            {"symbol": symbol, "interval": interval, "limit": limit, **kw},
+        )
+
+    def ticker_24hr(self, symbol: str | None = None) -> Any:
+        params = {"symbol": symbol} if symbol else {}
+        return self.get_public("/api/v3/ticker/24hr", params)
+
+    def ticker_price(self, symbol: str | None = None) -> Any:
+        params = {"symbol": symbol} if symbol else {}
+        return self.get_public("/api/v3/ticker/price", params)
+
+    def book_ticker(self, symbol: str | None = None) -> Any:
+        params = {"symbol": symbol} if symbol else {}
+        return self.get_public("/api/v3/ticker/bookTicker", params)
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  SIGNED — Orders
+    # ═══════════════════════════════════════════════════════════════════
+
+    def place_order(
+        self,
+        symbol: str,
+        side: str,
+        type: str,
+        *,
+        quantity: float | str | None = None,
+        quote_order_qty: float | str | None = None,
+        price: float | str | None = None,
+        time_in_force: str | None = None,
+        new_client_order_id: str | None = None,
+    ) -> dict:
+        params: dict[str, Any] = {"symbol": symbol, "side": side, "type": type}
+        if quantity is not None:
+            params["quantity"] = str(quantity)
+        if quote_order_qty is not None:
+            params["quoteOrderQty"] = str(quote_order_qty)
+        if price is not None:
+            params["price"] = str(price)
+        if time_in_force:
+            params["timeInForce"] = time_in_force
+        if new_client_order_id:
+            params["newClientOrderId"] = new_client_order_id
+        return self.post_signed("/api/v3/order", params, SPOT_STRICT_KEYS)
+
+    def query_order(self, symbol: str, order_id: int | None = None, **kw) -> dict:
+        params: dict[str, Any] = {"symbol": symbol, **kw}
+        if order_id:
+            params["orderId"] = order_id
+        return self.get_signed("/api/v3/order", params)
+
+    def cancel_order(self, symbol: str, order_id: int | None = None, **kw) -> dict:
+        params: dict[str, Any] = {"symbol": symbol, **kw}
+        if order_id:
+            params["orderId"] = order_id
+        return self.delete_signed("/api/v3/order", params)
+
+    def cancel_all_orders(self, symbol: str) -> dict:
+        return self.delete_signed("/api/v3/openOrders", {"symbol": symbol})
+
+    def open_order(self, symbol: str, order_id: int | None = None, **kw) -> dict:
+        params: dict[str, Any] = {"symbol": symbol, **kw}
+        if order_id:
+            params["orderId"] = order_id
+        return self.get_signed("/api/v3/openOrder", params)
+
+    def open_orders(self, symbol: str | None = None) -> list:
+        params = {"symbol": symbol} if symbol else {}
+        return self.get_signed("/api/v3/openOrders", params)
+
+    def all_orders(self, symbol: str, limit: int = 500, **kw) -> list:
+        return self.get_signed(
+            "/api/v3/allOrders", {"symbol": symbol, "limit": limit, **kw}
+        )
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  SIGNED — Account
+    # ═══════════════════════════════════════════════════════════════════
+
+    def account(self) -> dict:
+        return self.get_signed("/api/v3/account")
+
+    def trades_history(self, symbol: str, limit: int = 500, **kw) -> list:
+        return self.get_signed(
+            "/api/v3/myTrades", {"symbol": symbol, "limit": limit, **kw}
+        )
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  SIGNED — Transfer & Withdraw
+    # ═══════════════════════════════════════════════════════════════════
+
+    def transfer(
+        self, asset: str, amount: float, kind_type: str, client_tran_id: str
+    ) -> dict:
+        return self.post_signed(
+            "/api/v3/asset/wallet/transfer",
+            {
+                "asset": asset,
+                "amount": str(amount),
+                "kindType": kind_type,
+                "clientTranId": client_tran_id,
+            },
+        )
+
+    def withdraw_fees(self) -> list:
+        """Get withdraw fees (public)."""
+        return self.get_public("/api/v3/withdrawFee")
+
+    def withdraw(self, asset: str, amount: float, destination: str, **kw) -> dict:
+        return self.post_signed(
+            "/api/v3/withdraw",
+            {"asset": asset, "amount": str(amount), "destination": destination, **kw},
+        )
