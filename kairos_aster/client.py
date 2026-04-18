@@ -42,7 +42,6 @@ class BaseClient:
         self.show_weight = show_weight
         self._session = requests.Session()
         self._session.headers.update({
-            "Content-Type": "application/x-www-form-urlencoded",
             "User-Agent": "kairos-aster-sdk/0.1.0",
         })
 
@@ -84,7 +83,8 @@ class BaseClient:
             params, self.user, self.signer, self._private_key, strict_keys
         )
         url = f"{self.base_url}{path}"
-        return self._do("POST", url, data=signed)
+        return self._do("POST", url, data=signed,
+                        headers={"Content-Type": "application/x-www-form-urlencoded"})
 
     def delete_signed(
         self,
