@@ -10,14 +10,26 @@ Usage:
         private_key="0xYourAgentPrivateKey",
     )
     order = client.place_order("ASTERUSDT", "BUY", "MARKET", quantity=100)
+
+Spot V3 rollout status (as of 2026-04-19):
+    Some endpoints listed in the official docs are not yet active server-side.
+    Confirmed non-functional: account(), commission_rate().
+    Confirmed working: all public endpoints, place_order(), cancel_order(),
+    open_orders(), all_orders(), trades_history(), transfer(), withdraw().
+    Ref: Aster support ticket + Discord #api-discussion 2026-04-19.
 """
 
 from __future__ import annotations
 
+import warnings
 from typing import Any
 
 from .client import BaseClient
 from .auth import SPOT_STRICT_KEYS
+
+# Endpoints confirmed non-functional server-side during Spot v3 rollout.
+# The SDK code is correct (EIP-712); the limitation is on Aster's backend.
+_SERVER_UNIMPLEMENTED = frozenset(["/api/v3/account", "/api/v3/commissionRate"])
 
 _BASE = "https://sapi.asterdex.com"
 _TESTNET = "https://sapi.asterdex-testnet.com"
@@ -144,7 +156,23 @@ class SpotClient(BaseClient):
     # ═══════════════════════════════════════════════════════════════════
 
     def account(self) -> dict:
+        # Not yet implemented server-side during Spot v3 rollout (confirmed 2026-04-19).
+        warnings.warn(
+            "SpotClient.account() is not yet functional on sapi.asterdex.com "
+            "(Aster backend limitation, not an SDK issue). "
+            "Use FuturesClient.account() for futures account data.",
+            stacklevel=2,
+        )
         return self.get_signed("/api/v3/account")
+
+    def commission_rate(self, symbol: str) -> dict:
+        # Listed in official docs but not yet implemented server-side (confirmed 2026-04-19).
+        warnings.warn(
+            "SpotClient.commission_rate() is not yet functional on sapi.asterdex.com "
+            "(Aster backend limitation, not an SDK issue).",
+            stacklevel=2,
+        )
+        return self.get_signed("/api/v3/commissionRate", {"symbol": symbol})
 
     def trades_history(self, symbol: str, limit: int = 500, **kw) -> list:
         return self.get_signed(

@@ -399,6 +399,26 @@ client.place_order(
 
 ### SpotClient
 
+> **⚠️ Spot V3 rollout — partial availability (as of April 2026)**
+>
+> The Aster backend is still completing the Spot V3 migration. Some endpoints
+> listed in the official docs are **not yet active server-side** — this is an
+> Aster infrastructure limitation, not an SDK issue.
+>
+> | Endpoint | Status |
+> |----------|--------|
+> | All public endpoints (ping, depth, klines, ticker…) | ✅ Working |
+> | `place_order`, `cancel_order`, `open_orders`, `all_orders` | ✅ Working |
+> | `trades_history`, `transfer`, `withdraw` | ✅ Working |
+> | `account()` | ❌ Not yet active — server returns error |
+> | `commission_rate(symbol)` | ❌ Not yet active — server returns error |
+>
+> The SDK will emit a `UserWarning` when calling unimplemented endpoints.
+> Aster support ticket filed. Watch this section for updates.
+>
+> **Note on "HMAC SHA256" labels in official docs**: these are a documentation
+> error. V3 uses EIP-712 exclusively — HMAC is only for V1. This SDK is correct.
+
 ```python
 from kairos_aster import SpotClient
 
@@ -437,7 +457,8 @@ client = SpotClient(
 
 | Method | Description |
 |--------|-------------|
-| `account()` | Balances and info |
+| `account()` | Balances and info *(⚠️ not yet active server-side)* |
+| `commission_rate(symbol)` | Symbol fees *(⚠️ not yet active server-side)* |
 | `trades_history(symbol, limit=500)` | Trade history |
 | `withdraw_fees()` | Withdrawal fee schedule (public) |
 | `withdraw(asset, amount, destination)` | Withdraw funds |
