@@ -15,7 +15,7 @@ Quick start:
 Built by Kairos Lab — https://kairos-lab.org
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from .futures import FuturesClient
 from .spot import SpotClient
