@@ -2,18 +2,58 @@
 Tests for the auth module — the core of the SDK.
 
 Run: pytest tests/ -v
+
+The most important test in this file is TestSignatureRecovery — it
+proves the signature actually verifies against the claimed signer
+under canonical EIP-712 verification. Without this, signature
+correctness is unverifiable from the test suite alone (and a prior
+bug shipped because the suite only checked length/determinism).
 """
 
+import urllib.parse
+
 import pytest
+from eth_account import Account
+from eth_account.messages import encode_typed_data
+
 from kairos_aster.auth import (
-    build_msg,
-    sign_request,
-    inject_auth,
-    generate_agent_wallet,
+    DOMAIN,
     FUTURES_STRICT_KEYS,
     SPOT_STRICT_KEYS,
-    DOMAIN,
+    build_msg,
+    generate_agent_wallet,
+    inject_auth,
+    sign_message_string,
+    sign_request,
 )
+
+
+# Deterministic test key (DO NOT use in production)
+_TEST_PK = "0x4c0883a69102937d6231471b5dbb6204fe512961708279f9d92e8e632e85e3a2"
+_TEST_SIGNER = Account.from_key(_TEST_PK).address
+_USER = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+
+_TYPED_DATA_TEMPLATE = {
+    "types": {
+        "EIP712Domain": [
+            {"name": "name", "type": "string"},
+            {"name": "version", "type": "string"},
+            {"name": "chainId", "type": "uint256"},
+            {"name": "verifyingContract", "type": "address"},
+        ],
+        "Message": [{"name": "msg", "type": "string"}],
+    },
+    "primaryType": "Message",
+    "domain": DOMAIN,
+}
+
+
+def _server_recover(msg: str, sig: str) -> str:
+    """Simulate the Aster server: rebuild EIP-712 typed data from the msg
+    string and recover the signer address from the signature."""
+    typed = {**_TYPED_DATA_TEMPLATE, "message": {"msg": msg}}
+    signable = encode_typed_data(full_message=typed)
+    return Account.recover_message(signable, signature=sig)
 
 
 class TestBuildMsg:
@@ -48,8 +88,7 @@ class TestBuildMsg:
             "reduceOnly": "false",
         }
         msg = build_msg(params, FUTURES_STRICT_KEYS)
-        # strict keys first, then extras sorted
-        assert "symbol=BTCUSDT&side=BUY&type=LIMIT" in msg
+        assert msg.startswith("symbol=BTCUSDT&side=BUY&type=LIMIT")
         assert "price=50000" in msg
         assert "reduceOnly=false" in msg
 
@@ -65,6 +104,11 @@ class TestBuildMsg:
 
     def test_empty_params(self):
         assert build_msg({}) == ""
+
+    def test_url_encodes_special_chars(self):
+        # Spec uses urllib.parse.urlencode → server reconstructs identically
+        msg = build_msg({"clientTranId": "tx-2026 05 01"})
+        assert msg == "clientTranId=tx-2026+05+01"
 
 
 class TestDomain:
@@ -84,68 +128,117 @@ class TestDomain:
 
 
 class TestSignRequest:
-    """Verify signature output format."""
-
-    # Deterministic test key (DO NOT use in production)
-    _TEST_PK = "0x4c0883a69102937d6231471b5dbb6204fe512961708279f9d92e8e632e85e3a2"
+    """Verify signature output format and stability."""
 
     def test_returns_0x_prefixed(self):
-        sig = sign_request(self._TEST_PK, {"symbol": "BTCUSDT"})
+        sig = sign_request(_TEST_PK, {"symbol": "BTCUSDT"})
         assert sig.startswith("0x")
 
     def test_signature_length(self):
-        sig = sign_request(self._TEST_PK, {"symbol": "BTCUSDT"})
+        sig = sign_request(_TEST_PK, {"symbol": "BTCUSDT"})
         # 0x + 130 hex chars (65 bytes r+s+v)
         assert len(sig) == 132
 
     def test_deterministic(self):
         params = {"symbol": "BTCUSDT", "side": "BUY"}
-        sig1 = sign_request(self._TEST_PK, params)
-        sig2 = sign_request(self._TEST_PK, params)
+        sig1 = sign_request(_TEST_PK, params)
+        sig2 = sign_request(_TEST_PK, params)
         assert sig1 == sig2
 
     def test_different_params_different_sig(self):
-        sig1 = sign_request(self._TEST_PK, {"symbol": "BTCUSDT"})
-        sig2 = sign_request(self._TEST_PK, {"symbol": "ETHUSDT"})
+        sig1 = sign_request(_TEST_PK, {"symbol": "BTCUSDT"})
+        sig2 = sign_request(_TEST_PK, {"symbol": "ETHUSDT"})
         assert sig1 != sig2
+
+
+class TestSignatureRecovery:
+    """The crown-jewel tests — without these, signature correctness is
+    unverifiable from the test suite alone. A prior bug
+    (`encode_defunct` over the digest instead of `encode_typed_data`)
+    shipped because these tests didn't exist."""
+
+    def test_sign_message_string_recovers_to_signer(self):
+        msg = "symbol=BTCUSDT&side=BUY&type=MARKET&quantity=0.001"
+        sig = sign_message_string(_TEST_PK, msg)
+        assert _server_recover(msg, sig).lower() == _TEST_SIGNER.lower()
+
+    def test_inject_auth_signature_covers_full_body(self):
+        """Sign-then-strip: rebuild the same urlencoded msg the server sees
+        from the returned dict (minus signature) and prove the signature
+        recovers to _TEST_SIGNER. This catches:
+          - wrong signing primitive (encode_defunct vs encode_typed_data)
+          - signing only user params (missing nonce/user/signer)
+        """
+        signed = inject_auth(
+            {"symbol": "BTCUSDT", "side": "BUY", "type": "MARKET", "quantity": "0.001"},
+            user=_USER,
+            signer=_TEST_SIGNER,
+            private_key=_TEST_PK,
+            strict_keys=FUTURES_STRICT_KEYS,
+        )
+        sig = signed.pop("signature")
+        rebuilt_msg = urllib.parse.urlencode(signed)
+        recovered = _server_recover(rebuilt_msg, sig)
+        assert recovered.lower() == _TEST_SIGNER.lower(), (
+            f"signature must recover to signer; got {recovered}, expected {_TEST_SIGNER}\n"
+            f"rebuilt msg: {rebuilt_msg}"
+        )
+
+    def test_nonce_user_signer_are_at_end(self):
+        """Auth fields must come after user-provided params so the URL-encoded
+        msg matches Aster's reference impl exactly."""
+        signed = inject_auth(
+            {"symbol": "BTCUSDT", "side": "BUY", "type": "MARKET"},
+            user=_USER, signer=_TEST_SIGNER, private_key=_TEST_PK,
+            strict_keys=FUTURES_STRICT_KEYS,
+        )
+        keys = list(signed.keys())
+        assert keys[-4:] == ["nonce", "user", "signer", "signature"]
+
+    def test_modifying_param_invalidates_signature(self):
+        """Defense-in-depth: tampering with any field in the body breaks
+        recovery. Confirms the signature actually binds to the body."""
+        signed = inject_auth(
+            {"symbol": "BTCUSDT", "side": "BUY", "type": "MARKET"},
+            user=_USER, signer=_TEST_SIGNER, private_key=_TEST_PK,
+            strict_keys=FUTURES_STRICT_KEYS,
+        )
+        sig = signed.pop("signature")
+        signed["symbol"] = "ETHUSDT"  # tamper
+        rebuilt_msg = urllib.parse.urlencode(signed)
+        recovered = _server_recover(rebuilt_msg, sig)
+        assert recovered.lower() != _TEST_SIGNER.lower()
 
 
 class TestInjectAuth:
     """Verify the full auth injection flow."""
 
-    _TEST_PK = "0x4c0883a69102937d6231471b5dbb6204fe512961708279f9d92e8e632e85e3a2"
-    _USER = "0xMainWallet"
-    _SIGNER = "0xAgentWallet"
-
     def test_injects_all_fields(self):
         result = inject_auth(
             {"symbol": "BTCUSDT"},
-            self._USER, self._SIGNER, self._TEST_PK,
+            _USER, _TEST_SIGNER, _TEST_PK,
         )
-        assert result["user"] == self._USER
-        assert result["signer"] == self._SIGNER
+        assert result["user"] == _USER
+        assert result["signer"] == _TEST_SIGNER
         assert "nonce" in result
         assert result["signature"].startswith("0x")
 
     def test_preserves_original_params(self):
         result = inject_auth(
             {"symbol": "BTCUSDT", "side": "BUY"},
-            self._USER, self._SIGNER, self._TEST_PK,
+            _USER, _TEST_SIGNER, _TEST_PK,
         )
         assert result["symbol"] == "BTCUSDT"
         assert result["side"] == "BUY"
 
     def test_nonce_is_microsecond_precision(self):
-        result = inject_auth(
-            {}, self._USER, self._SIGNER, self._TEST_PK,
-        )
+        result = inject_auth({}, _USER, _TEST_SIGNER, _TEST_PK)
         nonce = int(result["nonce"])
-        # Should be in microseconds (> 1e15)
         assert nonce > 1_000_000_000_000_000
 
     def test_nonce_increments(self):
-        r1 = inject_auth({}, self._USER, self._SIGNER, self._TEST_PK)
-        r2 = inject_auth({}, self._USER, self._SIGNER, self._TEST_PK)
+        r1 = inject_auth({}, _USER, _TEST_SIGNER, _TEST_PK)
+        r2 = inject_auth({}, _USER, _TEST_SIGNER, _TEST_PK)
         assert int(r2["nonce"]) >= int(r1["nonce"])
 
 
@@ -166,3 +259,19 @@ class TestGenerateAgentWallet:
         w1 = generate_agent_wallet()
         w2 = generate_agent_wallet()
         assert w1["address"] != w2["address"]
+
+    def test_generated_key_can_sign_and_recover(self):
+        """End-to-end: a freshly generated agent can sign a body whose
+        signature recovers to the agent's address."""
+        wallet = generate_agent_wallet()
+        signed = inject_auth(
+            {"symbol": "BTCUSDT"},
+            user=_USER,
+            signer=wallet["address"],
+            private_key=wallet["private_key"],
+            strict_keys=FUTURES_STRICT_KEYS,
+        )
+        sig = signed.pop("signature")
+        rebuilt_msg = urllib.parse.urlencode(signed)
+        recovered = _server_recover(rebuilt_msg, sig)
+        assert recovered.lower() == wallet["address"].lower()

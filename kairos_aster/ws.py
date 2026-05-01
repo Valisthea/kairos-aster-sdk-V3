@@ -42,6 +42,7 @@ _FUTURES_WS_TESTNET = "wss://fstream.asterdex-testnet.com"
 _SPOT_WS_TESTNET = "wss://sstream.asterdex-testnet.com"
 
 _STREAM_PATTERN = re.compile(r"^[a-zA-Z0-9@_!.]+$")
+_LISTEN_KEY_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{8,256}$")
 
 
 def _validate_stream(name: str) -> str:
@@ -49,6 +50,18 @@ def _validate_stream(name: str) -> str:
     if not _STREAM_PATTERN.match(name):
         raise ValueError(f"Invalid stream name: {name!r}")
     return name
+
+
+def _validate_listen_key(key: str) -> str:
+    """Validate listen key shape before interpolating into the WebSocket URL.
+
+    The key originates from Aster's REST API but a poisoned proxy or
+    a misuse path could feed something containing `/` or `..` and pivot
+    the URL — sanitize defensively.
+    """
+    if not isinstance(key, str) or not _LISTEN_KEY_PATTERN.match(key):
+        raise ValueError(f"Invalid listen key: {key!r}")
+    return key
 
 
 class AsterWS:
@@ -108,7 +121,7 @@ class AsterWS:
 
         The key expires after 60 min — send keepalive PUTs.
         """
-        url = f"{self.base_url}/ws/{listen_key}"
+        url = f"{self.base_url}/ws/{_validate_listen_key(listen_key)}"
         async for msg in self._connect_and_iterate(url):
             yield msg
 

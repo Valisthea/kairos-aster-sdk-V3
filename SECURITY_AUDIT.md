@@ -1,17 +1,40 @@
-# OMEGA Security Audit — kairos-aster-sdk v0.1.0
+# OMEGA Security Audit — kairos-aster-sdk
 
 **Auditor**: OMEGA (Kairos Lab Security Research)
-**Date**: 2026-04-18
+**Initial audit**: 2026-04-18 (v0.1.0)
+**Re-audit + corrections**: 2026-05-01 (v0.2.0)
 **Scope**: Full codebase review — auth, client, futures, spot, ws, errors, enums
 **Severity Scale**: CRITICAL > HIGH > MEDIUM > LOW > INFO
 
 ---
 
+## ⚠️ Post-Audit Corrections (2026-05-01) — read first
+
+A re-review of the EIP-712 signing path against the official Aster v3 spec
+([`aster-finance-futures-api-v3.md`](https://github.com/asterdex/api-docs/blob/master/aster-finance-futures-api-v3.md))
+identified **two CRITICAL bugs that the initial v0.1.0 audit did not catch**.
+Both are fixed in v0.2.0; see the [Post-Audit Corrections](#post-audit-corrections-2026-05-01)
+section at the end of this document.
+
+The original v0.1.0 verdict ("EIP-712 implementation is correct") was wrong —
+the implementation produced signatures that could not authenticate against the
+production Aster server. The test suite did not catch this because it asserted
+signature length and determinism but never `Account.recover_message(...)` against
+the claimed signer. v0.2.0 adds `TestSignatureRecovery` precisely to prevent
+recurrence.
+
+---
+
 ## Executive Summary
 
-The SDK is **production-viable with 4 fixes required before public release**. No critical vulnerabilities found. The EIP-712 signing implementation correctly follows the Aster v3 spec. Main concerns are around secret handling in memory, a potential nonce edge case, and one WebSocket input validation gap.
+The SDK is **production-viable as of v0.2.0**. The EIP-712 signing implementation
+now correctly follows the Aster v3 spec — verified empirically by recovering
+signatures back to the expected signer address under canonical EIP-712
+verification. Concerns from the initial audit (secret handling in memory, nonce
+edge case, WebSocket input validation gap) are all addressed.
 
-**Verdict**: PASS with remediation (0 CRITICAL, 1 HIGH, 3 MEDIUM, 3 LOW, 2 INFO)
+**Initial verdict (v0.1.0, 2026-04-18)**: PASS with remediation — **invalidated by re-audit**
+**Current verdict (v0.2.0, 2026-05-01)**: PASS, all blockers fixed (2 CRITICAL fixed, 1 HIGH fixed, 3 MEDIUM fixed, 3 LOW partial, 2 INFO)
 
 ---
 
@@ -113,25 +136,161 @@ except (ValueError, TypeError):
 
 ---
 
-## Positive Observations
+## Positive Observations (v0.2.0)
 
-1. **EIP-712 implementation is correct** — domain separator, message hash, and `\x19\x01` prefix match the Aster spec exactly
-2. **Thread-safe nonce generation** — lock-based approach prevents duplicates in multi-threaded contexts
+1. **EIP-712 implementation is correct (v0.2.0)** — uses `encode_typed_data(full_message=...)` and signs the FULL URL-encoded body including `nonce`/`user`/`signer`, matching the official Aster spec example byte-for-byte. Verified empirically by `Account.recover_message(...)` returning the expected signer.
+2. **Thread-safe nonce generation with drift cap** — lock-based, monotonic, capped at 4 s ahead of wall clock so a burst can never push the nonce out of Aster's 5 s acceptance window
 3. **No hardcoded secrets** — all credentials come from constructor params / env vars
 4. **Proper error hierarchy** — `AsterAPIError` vs `AsterRequestError` separation is clean
 5. **Context manager support** — `with` statement for proper session cleanup
 6. **Rate limit backoff** — exponential backoff with 429/5xx retry is correctly implemented
 7. **Dependencies are minimal** — no `web3` bloat, just `eth-account` + `requests` + `websockets`
+8. **Stream and listen-key validation** — both paths sanitize against URL injection before opening a WebSocket connection
 
 ---
 
 ## Remediation Priority
 
-1. **[H-01]** — Fix before public release (mask private key in repr)
-2. **[M-03]** — Fix before release (Retry-After crash)
-3. **[M-02]** — Fix before release (stream validation)
-4. **[M-01]** — Fix before v0.2 (nonce drift cap)
-5. **[L-03]** — Fix before release (deprecation warning)
-6. **[L-01, L-02]** — Nice to have for v0.2
+1. ~~**[H-01]**~~ — ✅ Fixed in v0.1.0 (private key masked via `__repr__`)
+2. ~~**[M-03]**~~ — ✅ Fixed in v0.1.0 (Retry-After try/except + clamp)
+3. ~~**[M-02]**~~ — ✅ Fixed in v0.1.0 (stream regex validation)
+4. ~~**[M-01]**~~ — ✅ Fixed in v0.2.0 (nonce drift cap)
+5. **[L-03]** — Open: deprecated `asyncio.get_event_loop()` (replace with `get_running_loop()`)
+6. **[L-01, L-02]** — Open: entropy docstring, optional `verify` param
 
-**Estimated fix time**: 30 minutes for all pre-release items.
+---
+
+## Post-Audit Corrections (2026-05-01)
+
+After the initial v0.1.0 audit, a comparative re-review against the official
+Aster v3 specification identified two **CRITICAL** bugs in the EIP-712 signing
+path that prevented signatures from verifying server-side. Both are fixed in
+v0.2.0.
+
+### [C-01] CRITICAL — Wrong signing primitive (`encode_defunct` over EIP-712 digest)
+
+**File (was)**: `auth.py:122-128`
+**Severity**: CRITICAL
+**Status**: ✅ Fixed in v0.2.0
+
+**Description**: The previous `sign_request` computed the EIP-712 digest
+correctly, then re-wrapped it with EIP-191 personal-sign before signing:
+
+```python
+# v0.1.0 — broken
+digest = keccak(b"\x19\x01" + domain_hash + message_hash)
+signable = encode_defunct(hexstr=digest.hex())   # ← EIP-191 wrap on top of EIP-712
+signed = Account.sign_message(signable, private_key=private_key)
+```
+
+The actual signed hash was therefore
+`keccak("\x19Ethereum Signed Message:\n32" + eip712_digest)` instead of the
+EIP-712 digest itself. The Aster server uses `encode_structured_data(typed_data)`
++ `Account.sign_message(...)` (canonical EIP-712), so it reconstructs the digest
+and verifies via `ecrecover(digest, sig)`. With the old code, `ecrecover`
+returned a different address than the claimed `signer`, causing every signed
+request to fail with `-1022 Signature for this request is not valid`.
+
+**Empirical evidence**:
+- Test PK `0x4c0883a6...e85e3a2` (signer `0x34ee9937...41188b47`)
+- Old code's signature recovered to `0x82BdA1A32cA3e6AcE43eDF5e740067965ca5baC7`
+  under canonical EIP-712 verification — i.e. **garbage, not the signer**
+
+**Fix (v0.2.0)**:
+
+```python
+# v0.2.0 — correct
+typed_data = {
+    "types": _TYPES,
+    "primaryType": "Message",
+    "domain": DOMAIN,
+    "message": {"msg": msg},
+}
+signable = encode_typed_data(full_message=typed_data)
+signed = Account.sign_message(signable, private_key=private_key)
+return "0x" + signed.signature.hex()
+```
+
+Uses `eth_account.messages.encode_typed_data` (real EIP-712 typed-data signing).
+Verified by the new `TestSignatureRecovery::test_sign_message_string_recovers_to_signer`
+regression test.
+
+---
+
+### [C-02] CRITICAL — Signature did not cover `nonce` / `user` / `signer`
+
+**File (was)**: `auth.py:131-150`
+**Severity**: CRITICAL
+**Status**: ✅ Fixed in v0.2.0
+
+**Description**: `inject_auth` injected `nonce`, `user`, `signer` into the
+params dict *after* computing the signature over the original (pre-injection)
+params:
+
+```python
+# v0.1.0 — broken
+def inject_auth(params, user, signer, private_key, strict_keys=None):
+    nonce = _nonce()
+    signed_params = dict(params)
+    signed_params["nonce"] = nonce
+    signed_params["user"] = user
+    signed_params["signer"] = signer
+    sig = sign_request(private_key, params, strict_keys)  # ← signed ORIGINAL params
+    signed_params["signature"] = sig
+    return signed_params
+```
+
+The Aster server reconstructs the signed message from the **full request body**
+(per the spec example: `urllib.parse.urlencode(my_dict)` is called *after*
+injecting nonce/user/signer). With the old code, the server's reconstructed
+`msg` ≠ the message the SDK signed, so verification failed even if [C-01] had
+been correct.
+
+**Fix (v0.2.0)**:
+
+```python
+# v0.2.0 — correct
+def inject_auth(params, user, signer, private_key, strict_keys=None):
+    nonce = _nonce()
+    ordered = _ordered_params(params, strict_keys)
+    ordered["nonce"] = nonce
+    ordered["user"] = user
+    ordered["signer"] = signer
+    msg = urllib.parse.urlencode(ordered)             # ← URL-encode FULL dict
+    sig = sign_message_string(private_key, msg)      # ← sign FULL msg
+    ordered["signature"] = sig
+    return ordered
+```
+
+The signature now covers the full body. Verified by
+`TestSignatureRecovery::test_inject_auth_signature_covers_full_body` and
+`test_modifying_param_invalidates_signature` (defense-in-depth: tampering with
+any field breaks recovery).
+
+---
+
+### Why the v0.1.0 audit missed both
+
+The original `tests/test_auth.py` (21 tests) checked:
+- ✅ Signature is hex-prefixed and 132 chars
+- ✅ Determinism: same input → same signature
+- ✅ Different input → different signature
+- ❌ **Never** asserted `Account.recover_message(...)` equals the expected signer
+- ❌ **Never** compared against the official Aster spec test vector
+
+A signature can be deterministic, hex-prefixed, and 132 chars long — and still
+fail to verify against the claimed signer. The v0.1.0 suite was insufficient
+to detect either C-01 or C-02.
+
+### Process improvement (v0.2.0)
+
+A new `TestSignatureRecovery` class was added to the suite. Every signed
+request flow is now verified end-to-end by recovering the signer from the
+signature under canonical EIP-712 verification. Four tests:
+
+- `test_sign_message_string_recovers_to_signer`
+- `test_inject_auth_signature_covers_full_body` ← would have caught C-01 + C-02
+- `test_nonce_user_signer_are_at_end`
+- `test_modifying_param_invalidates_signature`
+
+Run `pytest tests/ -v` — all 27 tests pass on v0.2.0.
